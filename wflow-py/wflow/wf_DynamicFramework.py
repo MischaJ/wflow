@@ -3,21 +3,10 @@ wf_DynamicFramework
 -------------------
 
 This is a replacement for the standard pcraster/python DynamicFramwork class.\
-It provides extra functionality to simplify linking the models build in the framwork
+It provides extra functionality to simplify linking the models build in the framework
 with other models. The provided functionality allows external programs to control
 and interrogate the model.
 
-Compared to the original pcraster class the usermodel needs to be extended with
-the stateVariables() method which lists the state variables. Other items to be
-exchanged most be listed in the API section of the .ini file
-
-In addition, the following methods must also be called at  startup:
-    
-    - createRunId()
-
-$Author: schelle $
-$Id: wf_DynamicFramework.py 915 2014-02-10 07:33:56Z schelle $
-$Rev: 915 $
 """
 
 # TODO: rmove most exec statements and replace by getattr
@@ -28,7 +17,6 @@ import datetime
 import ConfigParser
 
 from wflow.wf_netcdfio import *
-# from wf_Timeoutput import *
 import pcrut
 import glob
 import traceback
@@ -42,6 +30,8 @@ from wflow_lib import *
 import time
 import calendar
 
+from wflow import __version__
+from wflow import __release__
 
 def log_uncaught_exceptions(ex_cls, ex, tb):
     global logging
@@ -264,12 +254,13 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
         self._addMethodToClass(self.wf_supplyVariableNamesAndRoles)
         self._addMethodToClass(self.wf_updateparameters)
         self._addAttributeToClass("ParamType", self.ParamType)
+        self._addAttributeToClass("timestepsecs", self.timestepsecs)
 
         if firstTimestep == 0:
             firstTimestep = 1
 
         # self._userModel()._setNrTimeSteps(lastTimeStep - firstTimestep + 1)
-        self._userModel()._setNrTimeSteps(lastTimeStep + 1)
+        self._userModel()._setNrTimeSteps(lastTimeStep)
         self._d_firstTimestep = 1
         self._userModel()._setFirstTimeStep(1)
         self._d_lastTimestep = lastTimeStep
@@ -565,6 +556,8 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
 
         caseName = self._userModel().caseName
         runId = self._userModel().runId
+        if modelVersion == "no version":
+            modelVersion = __release__
 
         configfile = self._userModel().configfile
         if not os.path.isdir(caseName + "/" + runId):
@@ -617,22 +610,22 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
 
 
         _initAPIVars(self)
-
         self.framework_setup = True
         caseName = self._userModel().caseName
         runId = self._userModel().runId
-
         self.outputFormat = int(configget(self._userModel().config, 'framework', 'outputformat', '1'))
         self.APIDebug = int(configget(self._userModel().config, 'framework', 'debug', str(self.APIDebug)))
-
         self.ncfile = configget(self._userModel().config, 'framework', 'netcdfinput', "None")
+        self.ncfilestates = configget(self._userModel().config, 'framework', "netcdfstatesinput", "None")
         self.ncoutfile = configget(self._userModel().config, 'framework', 'netcdfoutput', "None")
         self.ncoutfilestatic = configget(self._userModel().config, 'framework', 'netcdfstaticoutput', "None")
-        self.ncinfilestatic = configget(self._userModel().config, 'framework', 'netcdfstaticinput', "None")
+        self.ncoutfilestate = configget(self._userModel().config, 'framework', 'netcdfstatesoutput', "None")
+        self.ncfilestatic = configget(self._userModel().config, 'framework', 'netcdfstaticinput', "None")
         self.EPSG = configget(self._userModel().config, 'framework', 'EPSG', "EPSG:4326")
         self.ncfileformat = configget(self._userModel().config, 'framework', 'netcdf_format', "NETCDF4")
         self.ncfilecompression = configget(self._userModel().config, 'framework', 'netcdf_zlib', "True")
         self.ncfiledigits = configget(self._userModel().config, 'framework', 'netcdf_least_significant_digit', "None")
+
         if self.ncfiledigits == 'None':
             self.ncfiledigits = None
         else:
@@ -642,7 +635,6 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             self.ncfilecompression = True
         else:
             self.ncfilecompression = False
-
 
 
         # Set the re-init hint for the local model
@@ -665,12 +657,11 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                 self.timestepsecs = int(configget(self._userModel().config, 'run', 'timestepsecs', "86400"))
                 duration = self.datetime_laststep - self.datetime_firststep
                 nrseconds = duration.total_seconds()
-                self._userModel()._setNrTimeSteps(int(nrseconds / self.timestepsecs))
+                self._userModel()._setNrTimeSteps(int(nrseconds / self.timestepsecs) + 1)
                 self._userModel().timestepsecs = self.timestepsecs
                 self._d_firstTimestep = 1
                 self._userModel()._setFirstTimeStep(self._d_firstTimestep)
-                st = int(nrseconds / self.timestepsecs) + 1
-
+                self._d_lastTimestep = int(nrseconds / self.timestepsecs) + self._d_firstTimestep
             else:
                 self.logger.info(
                     "Not enough information in the [run] section. Need start and end time or a runinfo.xml file.... Reverting to default date/time")
@@ -690,8 +681,9 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             self._userModel()._setNrTimeSteps(int(nrseconds / self.timestepsecs) + 1)
             self._d_firstTimestep = 1
             self._userModel()._setFirstTimeStep(self._d_firstTimestep)
-            self._d_lastTimestep = int(nrseconds / self.timestepsecs)
+            self._d_lastTimestep = int(nrseconds / self.timestepsecs) + self._d_firstTimestep
 
+        # Setup all the netCDF files that may be used for input/output
         if self.ncfile != "None":
             mstacks = configsection(self._userModel().config, "inputmapstacks")
             varlst = []
@@ -700,45 +692,55 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             self.logger.debug("Found following input variables to get from netcdf file: " + str(varlst))
             self.NcInput = netcdfinput(os.path.join(caseName, self.ncfile), self.logger, varlst)
 
+
+        if self.ncfilestates != "None":
+            smaps = self._userModel().stateVariables()
+            maps = [s + ".map" for s in smaps]
+            self.logger.debug("Found following input states to get from netcdf file: " + str(maps))
+            self.NcInputStates = netcdfinputstates(os.path.join(caseName, self.ncfilestates), self.logger, maps)
+
+
+        if self.ncfilestatic != "None":
+            self.NcInputStatic = netcdfinputstatic(os.path.join(caseName, self.ncfilestatic), self.logger)
+
         if self.ncoutfile != 'None':  # Ncoutput
             buffer = int(configget(self._userModel().config, 'framework', 'netcdfwritebuffer', "50"))
             meta = {}
             meta['caseName'] = caseName
             meta['runId'] = runId
+            meta['wflow_version'] =__version__
+            meta['wflow_release'] =__release__
             self.NcOutput = netcdfoutput(os.path.join(caseName, runId, self.ncoutfile),
                                          self.logger, self.datetime_firststep,
-                                         self._d_lastTimestep - self._d_firstTimestep,
+                                         self._userModel().nrTimeSteps(),
                                          maxbuf=buffer, metadata=meta, EPSG=self.EPSG,
                                          timestepsecs=self.timestepsecs,Format=self.ncfileformat,
                                          zlib=self.ncfilecompression,least_significant_digit=self.ncfiledigits)
 
         if self.ncoutfilestatic != 'None':  # Ncoutput
-            buffer = int(configget(self._userModel().config, 'framework', 'netcdfwritebuffer', "2"))
             meta = {}
             meta['caseName'] = caseName
             meta['runId'] = runId
-            self.NcOutputStatic = netcdfoutput(os.path.join(caseName, runId, self.ncoutfilestatic),
-                                               self.logger, self.datetime_laststep,
-                                               self._d_lastTimestep - self._d_firstTimestep,
-                                               maxbuf=buffer, metadata=meta, EPSG=self.EPSG)
+            meta['wflow_version'] =__version__
+            meta['wflow_release'] =__release__
+            self.NcOutputStatic = netcdfoutputstatic(os.path.join(caseName, runId, self.ncoutfilestatic),
+                                                     self.logger, self.datetime_laststep,1,timestepsecs=self.timestepsecs,
+                                                     maxbuf=1, metadata=meta, EPSG=self.EPSG,Format=self.ncfileformat,
+                                                     zlib=self.ncfilecompression,least_significant_digit=self.ncfiledigits)
 
-        # if self.ncoutfilestate != 'None': # Ncoutput
-        #     buffer = int(configget(self._userModel().config,'framework','netcdfwritebuffer',"2"))
-        #     meta ={}
-        #     meta['caseName'] = caseName
-        #     meta['runId'] = runId
-        #     self.NcOutputState = netcdfoutput(os.path.join(caseName,runId,self.ncoutfilestate),
-        #                                        self.logger,self.datetime_laststep,
-        #                                         self._d_lastTimestep - self._d_firstTimestep + 1,
-        #                                        maxbuf=buffer,metadata=meta)
-
-
-        if self.ncinfilestatic != 'None':  # Ncoutput
-            buffer = int(configget(self._userModel().config, 'framework', 'netcdfwritebuffer', "2"))
+        if self.ncoutfilestate != 'None':  # Ncoutput
             meta = {}
             meta['caseName'] = caseName
             meta['runId'] = runId
-            self.NcInputStatic = netcdfinput(os.path.join(caseName, self.ncinfilestatic), self.logger, varlst)
+            meta['wflow_version'] =__version__
+            meta['wflow_release'] =__release__
+            self.NcOutputState = netcdfoutputstatic(os.path.join(caseName, runId, self.ncoutfilestate),
+                                                     self.logger, self.datetime_laststep,1,timestepsecs=self.timestepsecs,
+                                                     maxbuf=1, metadata=meta, EPSG=self.EPSG,Format=self.ncfileformat,
+                                                     zlib=self.ncfilecompression,least_significant_digit=self.ncfiledigits)
+
+
+
 
         # Fill the summary (stat) list from the ini file
         self.statslst = []
@@ -821,7 +823,7 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                 samplemapname = os.path.join(caseName,configget(self._userModel().config, thissection, "samplemap", "None"))
                 if "None" not in samplemapname:
                     try:
-                        self.samplemap = readmap(samplemapname)
+                        self.samplemap = self.wf_readmap(samplemapname,0.0,fail=True)
                         idd = tsformat + ":" + samplemapname
                         self.oscv[idd] = wf_OutputTimeSeriesArea(self.samplemap, oformat=tsformat)
                         self.logger.info("Adding " + tsformat + " output at " + samplemapname)
@@ -859,13 +861,13 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                     for z in savevar:
                         fname = os.path.join(directory, var + "_" + str(a)).replace("\\", "/") + ".map"
                         # report(z,fname)
-                        self.reportStatic(z, fname, style=1, gzipit=False, longname=fname)
+                        self.reportState(z, fname, style=1, gzipit=False, longname=fname)
                         a = a + 1
                 except:
                     # execstr = "report(self._userModel()." + var +",\"" + fname + "\")"
                     # exec  execstr
                     thevar = eval("self._userModel()." + var)
-                    self.reportStatic(thevar, fname, style=1, gzipit=False, longname=fname)
+                    self.reportState(thevar, fname, style=1, gzipit=False, longname=fname)
             except:
                 self.logger.warn("Problem saving state variable: " + var)
                 self.logger.warn(execstr)
@@ -983,8 +985,11 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             if nr == 0:
                 try:
                     mpath = os.path.join(directory, var + ".map").replace("\\", "/")
-                    execstr = "self._userModel()." + var + "= readmap(\"" + mpath + "\")"
-                    exec execstr
+                    tvar = self.wf_readmap(mpath,0.0,ncfilesource=self.ncfilestates)
+                    wf_readmtvar = self.wf_readmap(mpath,0.0,ncfilesource=self.ncfilestates)
+                    setattr(self._userModel(), var,tvar)
+                    #execstr = "self._userModel()." + var + "= readmap(\"" + mpath + "\")"
+                    #exec execstr
                 except:
                     self.logger.error(
                         "problem while reading state variable from disk: " + mpath + " Suggest to use the -I uption to restart")
@@ -1015,12 +1020,17 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
         it uses the wf_supplyVariableNamesAndRoles() function to find them.
         The variables are inserted into the model object
 
-
         """
         allvars = self._userModel().stateVariables()
 
         for var in allvars:
             exec "self._userModel()." + var + " = self._userModel()." + var + "_laststep"
+
+        ts = self._userModel().currentTimeStep()
+        self._userModel()._setCurrentTimeStep(ts)
+        self.currentdatetime = self.currentdatetime - dt.timedelta(seconds=self._userModel().timestepsecs)
+        self._userModel().currentdatetime = self.currentdatetime
+        self.logger.debug("Going one timestep back, redoing: " + str(ts) + " " + str(self.currentdatetime))
 
     def iniFileSetUp(self, caseName, runId, configfile):
         """
@@ -1126,7 +1136,6 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             exec "self._userModel()." + mapname + " = arpcr"
             return 0
 
-            # TODO: add getrowcol
 
     def wf_setValueRowCol(self, mapname, value, row, col):
         """
@@ -1769,7 +1778,7 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                 if gzipit:
                     Gzip(path, storePath=True)
             else:
-                self.NcOutputStatic.savetimestep(self._userModel().currentTimeStep(), variable, var=name, name=longname)
+                self.NcOutputStatic.savetimestep(1, variable, var=name, name=longname)
 
         elif self.outputFormat == 2:
             numpy.savez(path, pcr2numpy(variable, -999))
@@ -1777,6 +1786,44 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             numpy.savez(path, pcr2numpy(variable, -999))
         elif self.outputFormat == 4:
             numpy.savetxt(path, pcr2numpy(variable, -999), fmt="%0.6g")
+
+
+    def reportState(self, variable, name, style=1, gzipit=False, longname=None):
+        """
+
+        :param variable:
+        :param name:
+        :param style:
+        :param gzipit:
+        :param longname:
+        :return:
+        """
+        if longname == None:
+            longname = name
+        path = name
+
+        if self.outputFormat == 1:
+            if sys.version_info[0] == 2 and sys.version_info[1] >= 6:
+                try:
+                    import pcraster as PCRaster
+                except:
+                    import PCRaster as PCRaster
+            else:
+                import PCRaster
+            if not hasattr(self, 'NcOutputState'):
+                PCRaster.report(variable, path)
+                if gzipit:
+                    Gzip(path, storePath=True)
+            else:
+                self.NcOutputState.savetimestep(1, variable, var=name, name=longname)
+
+        elif self.outputFormat == 2:
+            numpy.savez(path, pcr2numpy(variable, -999))
+        elif self.outputFormat == 3:
+            numpy.savez(path, pcr2numpy(variable, -999))
+        elif self.outputFormat == 4:
+            numpy.savetxt(path, pcr2numpy(variable, -999), fmt="%0.6g")
+
 
     def _reportNew(self, variable, name, style=1, gzipit=False, longname=None):
         """
@@ -1893,7 +1940,7 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
 
 
 
-    def wf_readmap(self, name, default, verbose=True,fail=False):
+    def wf_readmap(self, name, default, verbose=True,fail=False,ncfilesource="not set"):
         """
           Adjusted version of readmapNew. the style variable is used to indicated
           how the data is read::
@@ -1917,6 +1964,13 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
 
         style = self.exchnageitems.getvarStyle(varname)
 
+        # set this for initil (before the model is actually running)
+        if os.path.splitext(name)[1] == ".map":
+            newName = name
+        else:
+            newName = name + nameSuffix
+
+
         if hasattr(self._userModel(), "_inStochastic"):
             if self._userModel()._inStochastic():
                 if self._userModel()._inPremc() or self._userModel()._inPostmc():
@@ -1932,8 +1986,10 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                     newName = name + nameSuffix
 
         if self._inResume():
-            timestep = self._userModel().firstTimeStep()
-            newName = generateNameT(name, timestep - 1)
+            if os.path.splitext(name)[1] == ".map":
+                newName = name
+            else:
+                newName = name + nameSuffix
 
         if hasattr(self._userModel(), "_inDynamic"):
             if self._userModel()._inDynamic() or self._inUpdateWeight():
@@ -1945,9 +2001,12 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
             assert path is not ""
 
             if self._userModel()._inDynamic():
-                if self.ncfile != "None":
-                    retval = self.NcInput.gettimestep(self._userModel().currentTimeStep(), self.logger, var=varname)
-                    return retval
+                if 'None' not in self.ncfile:
+                    retval, succ = self.NcInput.gettimestep(self._userModel().currentTimeStep(), self.logger, var=varname)
+                    if succ:
+                        return retval
+                    else:
+                        return scalar(default)
 
                 if os.path.isfile(path):
                     mapje = readmap(path)
@@ -1959,7 +2018,19 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                         self.logger.error("Required map: " + os.path.abspath(path) + " not found, exiting..")
                         sys.exit(1)
                     return scalar(default)
-            if self._userModel()._inInitial():
+
+            elif self._userModel()._inInitial():
+                if 'None' not in self.ncfilestatic:
+                    retval, succ = self.NcInputStatic.gettimestep(1, self.logger, var=varname)
+                    if succ:
+                        return retval
+                    else:
+                        if fail:
+                            self.logger.error("Required map: " + os.path.abspath(path) + " not found in " + self.ncfilestatic + "  exiting..")
+                            sys.exit(1)
+                        else:
+                            return scalar(default)
+
                 if os.path.isfile(path):
                     mapje = readmap(path)
                     return mapje
@@ -1970,6 +2041,48 @@ class wf_DynamicFramework(frameworkBase.FrameworkBase):
                         self.logger.error("Required map: " + os.path.abspath(path) + " not found, exiting..")
                         sys.exit(1)
                     return scalar(default)
+
+            elif self._inResume():
+                if ncfilesource == self.ncfilestates and ncfilesource not in 'None':
+                    retval, succ = self.NcInputStates.gettimestep(1, self.logger, var=varname)
+                    if succ:
+                        return retval
+                    else:
+                        return scalar(default)
+
+                if os.path.isfile(path):
+                    mapje = readmap(path)
+                    return mapje
+                else:
+                    if verbose:
+                        self.logger.debug("State input data (" + os.path.abspath(path) + ")  not present, returning " + str(default))
+                    if fail:
+                        self.logger.error("Required map: " + os.path.abspath(path) + " not found, exiting..")
+                        sys.exit(1)
+                    return scalar(default)
+            else: # Assuming we are in pre-or post loop within the framwork
+                if "None" not in self.ncfilestatic:
+                    retval, succ = self.NcInputStatic.gettimestep(1, self.logger, var=varname)
+                    if succ:
+                        return retval
+                    else:
+                        if fail:
+                            self.logger.error("Required map: " + os.path.abspath(path) + " not found in " + self.ncfilestatic + "  exiting..")
+                            sys.exit(1)
+                        else:
+                            return scalar(default)
+
+                if os.path.isfile(path):
+                    mapje = readmap(path)
+                    return mapje
+                else:
+                    if verbose:
+                        self.logger.debug("Static input data (" + os.path.abspath(path) + ")  not present, returning " + str(default))
+                    if fail:
+                        self.logger.error("Required map: " + os.path.abspath(path) + " not found, exiting..")
+                        sys.exit(1)
+                    return scalar(default)
+
 
 
         elif style == 2:  # Assuming they are set in memory by the API

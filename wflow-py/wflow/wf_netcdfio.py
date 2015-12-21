@@ -59,7 +59,7 @@ def convertCoord(proj_src, proj_trg, x, y):
     return X,Y
 
 
-def prepare_nc(trgFile, timeList, x, y, metadata, logger, EPSG="EPSG:4326", units='Days since 1900-01-01 00:00:00',
+def prepare_nc(trgFile, timeList, x, y, metadata, logger, EPSG="EPSG:4326", units=None,
                calendar='gregorian', Format="NETCDF4", complevel=9, zlib=True, least_significant_digit=None):
     """
     This function prepares a NetCDF file with given metadata, for a certain year, daily basis data
@@ -68,6 +68,12 @@ def prepare_nc(trgFile, timeList, x, y, metadata, logger, EPSG="EPSG:4326", unit
     import datetime as dt
 
     logger.info('Setting up netcdf output: ' + trgFile)
+
+    if units == None: # Use start of the run
+        epoch = timeList[0]
+        units = 'seconds since %04d-%02d-%02d %02d:%02d:%02d.0 00:00' % (
+        epoch.year, epoch.month, epoch.day, epoch.hour, epoch.minute, epoch.second)
+
     startDayNr = netCDF4.date2num(timeList[0].replace(tzinfo=None), units=units, calendar=calendar)
     endDayNr = netCDF4.date2num(timeList[-1].replace(tzinfo=None), units=units, calendar=calendar)
 
@@ -187,13 +193,9 @@ class netcdfoutput():
         self.Format = Format
         self.least_significant_digit = least_significant_digit
 
-        def date_range(start, end, tdelta="days"):
-            if tdelta == "days":
-                r = (end + dt.timedelta(days=1) - start).days
-                return [start + dt.timedelta(days=i) for i in range(r)]
-            else:
-                r = (end + dt.timedelta(days=1) - start).days * 24
-                return [start + dt.timedelta(hours=i) for i in range(r)]
+        def date_range(start, end, timestepsecs):
+                r = int((end + dt.timedelta(seconds=timestepsecs) - start).total_seconds()/timestepsecs)
+                return [start + dt.timedelta(seconds=(timestepsecs * i)) for i in range(r)]
 
         self.logger = logger
         # Do not allow a max buffer larger than the number of timesteps
@@ -208,16 +210,11 @@ class netcdfoutput():
         x = _pcrut.pcr2numpy(_pcrut.xcoordinate(_pcrut.boolean(_pcrut.cover(1.0))), NaN)[0, :]
         y = _pcrut.pcr2numpy(_pcrut.ycoordinate(_pcrut.boolean(_pcrut.cover(1.0))), NaN)[:, 0]
 
-        end = starttime + dt.timedelta(seconds=timestepsecs * self.timesteps - 1)
+        # Shift one timestep as we output at the end
+        #starttime = starttime + dt.timedelta(seconds=timestepsecs)
+        end = starttime + dt.timedelta(seconds=timestepsecs * (self.timesteps -1))
 
-        if timestepsecs == 86400:
-            timeList = date_range(starttime, end, tdelta="days")
-        elif timestepsecs == 3600:
-            timeList = date_range(starttime, end, tdelta="hours")
-        else:
-            logger.error("Current timestep: " + str(timestepsecs) + " not supported in netcdf writing.")
-            timeList = date_range(starttime, end, tdelta="days")
-
+        timeList = date_range(starttime, end, timestepsecs)
         self.timestepbuffer = zeros((self.maxbuf, len(y), len(x)))
         self.bufflst = {}
 
@@ -270,7 +267,7 @@ class netcdfoutput():
             self.nc_trg.sync()
 
         miss = float(nc_var._FillValue)
-        data = pcr2numpy(pcrdata, miss)
+        data = pcr2numpy(scalar(pcrdata), miss)
 
         if self.bufflst.has_key(var):
             self.bufflst[var][bufpos, :, :] = data
@@ -298,7 +295,127 @@ class netcdfoutput():
             self.nc_trg.close()
 
 
-# c:\repos\Hydrology\trunk\bias-correction\CM_climatology.py
+class netcdfoutputstatic():
+    def __init__(self, netcdffile, logger, starttime, timesteps, EPSG="EPSG:4326", timestepsecs=86400,
+                 metadata={}, zlib=True, Format="NETCDF4",
+                 maxbuf=25, least_significant_digit=None):
+        """
+        Under construction
+        """
+
+        self.EPSG = EPSG
+        self.zlib = zlib
+        self.Format = Format
+        self.least_significant_digit = least_significant_digit
+
+        def date_range(start, end, timestepsecs):
+                r = int((end + dt.timedelta(seconds=timestepsecs) - start).total_seconds()/timestepsecs)
+                return [start + dt.timedelta(seconds=(timestepsecs * i)) for i in range(r)]
+
+        self.logger = logger
+        # Do not allow a max buffer larger than the number of timesteps
+        self.maxbuf = maxbuf if timesteps >= maxbuf else timesteps
+        self.ncfile = netcdffile
+        self.timesteps = timesteps
+        rows = pcraster._pcraster.clone().nrRows()
+        cols = pcraster._pcraster.clone().nrCols()
+        cellsize = pcraster._pcraster.clone().cellSize()
+        yupper = pcraster._pcraster.clone().north()
+        xupper = pcraster._pcraster.clone().west()
+        x = _pcrut.pcr2numpy(_pcrut.xcoordinate(_pcrut.boolean(_pcrut.cover(1.0))), NaN)[0, :]
+        y = _pcrut.pcr2numpy(_pcrut.ycoordinate(_pcrut.boolean(_pcrut.cover(1.0))), NaN)[:, 0]
+
+        # Shift one timestep as we output at the end
+        #starttime = starttime + dt.timedelta(seconds=timestepsecs)
+        end = starttime + dt.timedelta(seconds=timestepsecs * (self.timesteps -1))
+
+        timeList = date_range(starttime, end, timestepsecs)
+        self.timestepbuffer = zeros((self.maxbuf, len(y), len(x)))
+        self.bufflst = {}
+        self.buffdirty = False
+
+        globmetadata.update(metadata)
+
+        prepare_nc(self.ncfile, timeList, x, y, globmetadata, logger, Format=self.Format, EPSG=EPSG,zlib=self.zlib,
+                   least_significant_digit=self.least_significant_digit)
+
+
+    def savetimestep(self, timestep, pcrdata, unit="mm", var='P', name="Precipitation"):
+        """
+        save a single timestep for a variable
+
+        input:
+            - timestep - current timestep
+            - pcrdata - pcraster map to save
+            - unit - unit string
+            - var - variable string
+            - name - name of the variable
+        """
+        # Open target netCDF file
+        var = os.path.basename(var)
+        self.nc_trg = netCDF4.Dataset(self.ncfile, 'a', format=self.Format, zlib=self.zlib, complevel=9)
+        self.nc_trg.set_fill_off()
+        # read time axis and convert to time objects
+        # TODO: use this to append time
+        # time = self.nc_trg.variables['time']
+        # timeObj = netCDF4.num2date(time[:], units=time.units, calendar=time.calendar)
+
+        idx = timestep - 1
+
+        buffreset = (idx + 1) % self.maxbuf
+        bufpos = (idx) % self.maxbuf
+
+        try:
+            nc_var = self.nc_trg.variables[var]
+        except:
+            self.logger.debug("Creating variable " + var + " in netcdf file. Format: " + self.Format)
+            if self.EPSG.lower() == "epsg:4326":
+                nc_var = self.nc_trg.createVariable(var, 'f4', ('time', 'lat', 'lon',), fill_value=-9999.0, zlib=self.zlib,
+                                                    complevel=9, least_significant_digit=self.least_significant_digit)
+                nc_var.coordinates = "lat lon"
+            else:
+                nc_var = self.nc_trg.createVariable(var, 'f4', ('time', 'y', 'x',), fill_value=-9999.0, zlib=self.zlib,
+                                                    complevel=9, least_significant_digit=self.least_significant_digit)
+                nc_var.coordinates = "lat lon"
+                nc_var.grid_mapping = "crs"
+
+            nc_var.units = unit
+            nc_var.standard_name = name
+            self.nc_trg.sync()
+
+        miss = float(nc_var._FillValue)
+        data = pcr2numpy(scalar(pcrdata), miss)
+
+        if self.bufflst.has_key(var):
+            self.bufflst[var][bufpos, :, :] = data
+            self.buffdirty = True
+        else:
+            self.bufflst[var] = self.timestepbuffer.copy()
+            self.bufflst[var][bufpos, :, :] = data
+            self.buffdirty = True
+
+        # Write out timestep buffer.....
+
+        if buffreset == 0 or idx == self.maxbuf - 1 or self.timesteps <= timestep:
+            spos = idx - bufpos
+            self.logger.debug(
+                "Writing buffer for " + var + " to file at: " + str(spos) + " " + str(int(bufpos) + 1) + " timesteps")
+            nc_var[spos:idx + 1, :, :] = self.bufflst[var][0:bufpos + 1, :, :]
+            self.nc_trg.sync()
+            self.buffdirty = False
+
+    def finish(self):
+        """
+        Flushes and closes the netcdf file
+
+        :return: Nothing
+        """
+        if hasattr(self, "nc_trg"):
+            self.nc_trg.sync()
+            self.nc_trg.close()
+            if self.buffdirty:
+                self.logger.error('Finishing with dirty netcdf write buffer...!')
+
 
 class netcdfinput():
     def __init__(self, netcdffile, logging, vars=[]):
@@ -348,10 +465,109 @@ class netcdfinput():
                 logging.debug("reading new netcdf data block starting at: " + str(ncindex))
                 for vars in self.alldat:
                     self.alldat[vars] = self.dataset.variables[vars][ncindex:ncindex + self.maxsteps]
+
                 self.fstep = ncindex
                 self.lstep = ncindex + self.maxsteps
             np_step = self.alldat[var][ncindex - self.fstep, :, :]
-            return numpy2pcr(Scalar, np_step, 1E31)
+            miss = float(self.dataset.variables[var]._FillValue)
+            return numpy2pcr(Scalar, np_step, miss), True
+        else:
+            #logging.debug("Var (" + var + ") not found returning 0")
+            return cover(scalar(0.0)), False
+
+
+class netcdfinputstates():
+    def __init__(self, netcdffile, logging, vars=[]):
+        """
+        First try to setup a class read netcdf files
+        (converted with pcr2netcdf.py)
+
+        netcdffile: file to read the forcing data from
+        logging: python logging object
+        vars: list of variables to get from file
+        """
+
+        if os.path.exists(netcdffile):
+            self.dataset = netCDF4.Dataset(netcdffile, mode='r')
+        else:
+            logging.error(os.path.abspath(netcdffile) + " not found!")
+            exit(ValueError)
+
+        logging.info("Reading state input from netCDF file: " + netcdffile + ": " + str(self.dataset).replace('\n', ' '))
+        self.alldat = {}
+        a = pcr2numpy(cover(0.0), 0.0).flatten()
+        # Determine steps to load in mem based on estimated memory usage
+        floatspermb = 1048576 / 4
+        maxmb = 4000
+        self.maxsteps = maxmb * len(a) / floatspermb + 1
+        self.fstep = 0
+        self.lstep = self.fstep + self.maxsteps
+
+        for var in vars:
+            try:
+                self.alldat[var] = self.dataset.variables[var][self.fstep:self.maxsteps]
+            except:
+                self.alldat.pop(var, None)
+                logging.warn("Variable " + var + " not found in netcdf file: " + netcdffile)
+
+    def gettimestep(self, timestep, logging, var='P'):
+        """
+        Gets a map for a single timestep. reads data in blocks assuming sequential access
+
+        timestep: framework timestep (1-based)
+        logging: python logging object
+        var: variable to get from the file
+        """
+        ncindex = timestep - 1
+        if self.alldat.has_key(var):
+            if ncindex == self.lstep:  # Read new block of data in mem
+                logging.debug("reading new netcdf data block starting at: " + str(ncindex))
+                for vars in self.alldat:
+                    self.alldat[vars] = self.dataset.variables[vars][ncindex:ncindex + self.maxsteps]
+                self.fstep = ncindex
+                self.lstep = ncindex + self.maxsteps
+            np_step = self.alldat[var][ncindex - self.fstep, :, :]
+            miss = float(self.dataset.variables[var]._FillValue)
+            return numpy2pcr(Scalar, np_step, miss), True
         else:
             logging.debug("Var (" + var + ") not found returning 0")
-            return cover(scalar(0.0))
+            return cover(scalar(0.0)), False
+
+
+class netcdfinputstatic():
+    def __init__(self, netcdffile, logging):
+        """
+        First try to setup a class read netcdf files
+        (converted with pcr2netcdf.py)
+
+        netcdffile: file to read the forcing data from
+        logging: python logging object
+        vars: list of variables to get from file
+        """
+
+        if os.path.exists(netcdffile):
+            self.dataset = netCDF4.Dataset(netcdffile, mode='r')
+        else:
+            logging.error(os.path.abspath(netcdffile) + " not found!")
+            exit(ValueError)
+
+        logging.info("Reading static input from netCDF file: " + netcdffile + ": " + str(self.dataset).replace('\n', ' '))
+
+
+
+    def gettimestep(self, timestep, logging, var='P'):
+        """
+        Gets a map for a single timestep. reads data in blocks assuming sequential access
+
+        timestep: framework timestep (1-based)
+        logging: python logging object
+        var: variable to get from the file
+        """
+
+        if self.dataset.variables.has_key(var):
+            np_step = self.dataset.variables[var][timestep-1,:,:]
+            miss = float(self.dataset.variables[var]._FillValue)
+            return numpy2pcr(Scalar, np_step, miss), True
+        else:
+            logging.debug("Var (" + var + ") not found returning 0")
+            return cover(scalar(0.0)), False
