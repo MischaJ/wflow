@@ -52,7 +52,7 @@ def usage(*args):
 
 class WflowModel(DynamicModel):  
   """
-  The user defined model class. T
+  The user defined model class. Testje Mischa github...
   """
   
   def __init__(self, cloneMap,Dir,RunDir,configfile):
